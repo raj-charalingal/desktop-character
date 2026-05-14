@@ -33,7 +33,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config — drawn-fallback defaults (overridden dynamically when image loads)
 # ---------------------------------------------------------------------------
-WIN_W, WIN_H = 120, 165
+WIN_W, WIN_H = 150, 220
 CHROMA       = '#00FF00'   # pixels of this exact colour → transparent on Windows
 FPS          = 16
 ANIM_MS      = 1000 // FPS
@@ -50,6 +50,7 @@ C_BEARD = '#EFEFEF'
 C_EYE_P = '#111111'
 
 NFRAMES      = 8
+HR           = 20          # drawn head radius in pixels
 # When frozen by PyInstaller, files live under sys._MEIPASS
 _BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(_BASE, 'assets')
@@ -74,14 +75,10 @@ class State(Enum):
 # ---------------------------------------------------------------------------
 class Sprite:
     """
-    Renders Modi on a tkinter Canvas.
-
-    Image mode  — loads assets/modi.png (or first .png found), resizes it,
-                  mirrors for left-facing, adds a walk-bob effect.
-    Drawn mode  — fallback geometric character when no PNG is present.
-
-    To switch to real sprites later: drop PNG(s) into assets/ and restart.
-    Character should face RIGHT in the source image.
+    Game-character style Modi:
+      - Real face extracted from assets/modi.png and used as the head
+      - Fully animated drawn body: arms and legs swing independently
+      - Walking, running, waving, idle animations all work frame-by-frame
     """
 
     def __init__(self, canvas: tk.Canvas, cx: int, cy: int):
@@ -91,18 +88,21 @@ class Sprite:
         self.state = State.IDLE
         self.frame = 0
         self._ids: list[int] = []
-
-        # Per-state animation frames (kept alive to prevent GC)
-        self._frames: dict[State, list[ImageTk.PhotoImage]] = {}
         self.img_w = 0
         self.img_h = 0
 
-        self._load_sprite_image()
+        # Real face image (right + left facing), kept alive to avoid GC
+        self._face_r: 'ImageTk.PhotoImage | None' = None
+        self._face_l: 'ImageTk.PhotoImage | None' = None
+        self._face_w = 0
+        self._face_h = 0
+
+        self._load_face()
 
     # -- public API --
 
     def has_image(self) -> bool:
-        return bool(self._frames)
+        return self._face_r is not None
 
     def advance(self):
         self.frame = (self.frame + 1) % NFRAMES
@@ -111,9 +111,10 @@ class Sprite:
     def set_state(self, s: State):
         self.state = s
 
-    # -- image loading & frame generation --
+    # -- face extraction --
 
-    def _load_sprite_image(self):
+    def _load_face(self):
+        """Load modi.png and crop out just the face/head to use on the drawn body."""
         if not HAS_PIL:
             return
         try:
@@ -131,47 +132,37 @@ class Sprite:
         try:
             img = Image.open(path).convert('RGBA')
             img.thumbnail((IMG_MAX_W, IMG_MAX_H), Image.LANCZOS)
-            self.img_w = img.width
-            self.img_h = img.height
-            mir = ImageOps.mirror(img)
 
-            print(f"Sprite loaded: {chosen}  ({img.width} × {img.height} px)")
-            print("Generating animation frames…")
-
-            self._frames = {
-                State.IDLE:  self._tilt_frames(img, n=6, amp=0.8),   # gentle idle sway
-                State.WALKR: self._tilt_frames(img, n=8, amp=3.5),
-                State.WALKL: self._tilt_frames(mir, n=8, amp=3.5),
-                State.RUNR:  self._tilt_frames(img, n=8, amp=7.0),
-                State.RUNL:  self._tilt_frames(mir, n=8, amp=7.0),
-                State.WAVE:  self._wave_frames(img),
-            }
-            print("Frames ready.")
+            face = self._extract_face(img)
+            if face:
+                self._face_w = face.width
+                self._face_h = face.height
+                self._face_r = ImageTk.PhotoImage(face)
+                self._face_l = ImageTk.PhotoImage(ImageOps.mirror(face))
+                print(f"Face loaded from {chosen}: {face.width}×{face.height} px")
+            else:
+                print(f"Could not isolate face in {chosen} — using drawn head")
         except Exception as exc:
-            print(f"Warning — could not load sprite image: {exc}")
+            print(f"Warning — {exc}")
 
-    def _tilt_frames(self, img: 'Image.Image', n: int, amp: float) -> list:
-        """Generate n frames by rocking the image ±amp degrees (sine wave)."""
-        frames = []
-        for i in range(n):
-            phase = i / n * 2 * math.pi
-            angle = math.sin(phase) * amp
-            rotated = img.rotate(angle, resample=Image.BICUBIC, expand=False)
-            frames.append(ImageTk.PhotoImage(rotated))
-        return frames
+    def _extract_face(self, img: 'Image.Image') -> 'Image.Image | None':
+        """
+        Crop the head region from a full-body portrait with transparent background.
+        Finds non-transparent pixels in the top 30% to locate the head precisely.
+        """
+        top_h = int(img.height * 0.30)
+        bbox  = img.crop((0, 0, img.width, top_h)).getbbox()
+        if not bbox:
+            return None
+        l, t, r, b = bbox
+        pad  = 5
+        face = img.crop((max(0, l - pad), max(0, t - pad),
+                         min(img.width, r + pad), min(top_h, b + pad)))
+        # Scale to fit the drawn head (HR*2 diameter)
+        face.thumbnail((HR * 2 + 8, HR * 2 + 8), Image.LANCZOS)
+        return face
 
-    def _wave_frames(self, img: 'Image.Image') -> list:
-        """8 frames: rock side-to-side with increasing then decreasing amplitude."""
-        frames = []
-        for i in range(8):
-            phase = i / 8 * 2 * math.pi
-            angle = math.sin(phase) * 8          # ±8° rock for wave
-            lean  = math.sin(phase * 2) * 3      # extra shimmy
-            rotated = img.rotate(angle + lean, resample=Image.BICUBIC, expand=False)
-            frames.append(ImageTk.PhotoImage(rotated))
-        return frames
-
-    # -- rendering --
+    # -- render --
 
     def _clear(self):
         for i in self._ids:
@@ -183,151 +174,135 @@ class Sprite:
 
     def _render(self):
         self._clear()
-        if self.has_image():
-            self._render_image()
-        else:
-            self._render_drawn()
+        self._render_body()
 
-    # -- image-based render --
-
-    def _render_image(self):
-        c    = self.c
-        x, y = self.cx, self.cy
-        s    = self.state
-
-        frames = self._frames.get(s, self._frames.get(State.IDLE, []))
-        if not frames:
-            return
-
-        img_ref   = frames[self.frame % len(frames)]
-        phase     = (self.frame / NFRAMES) * 2 * math.pi
-        moving    = s in (State.WALKL, State.WALKR, State.RUNL, State.RUNR)
-        running   = s in (State.RUNL,  State.RUNR)
-        waving    = s == State.WAVE
-
-        # Vertical bob: moves character up/down to simulate footsteps
-        if running:
-            bob = int(abs(math.sin(phase)) * 8)
-        elif moving:
-            bob = int(abs(math.sin(phase)) * 4)
-        elif waving:
-            bob = int(abs(math.sin(phase * 2)) * 3)
-        else:
-            bob = int(abs(math.sin(phase * 0.5)) * 1)   # barely-there idle breath
-
-        self._put(c.create_image(x, y - bob, image=img_ref, anchor='s'))
-
-    # -- drawn-fallback render --
-
-    def _render_drawn(self):
+    def _render_body(self):
+        """
+        Draw the full animated character each frame.
+        Uses swinging leg/arm math for walk/run/wave.
+        Head is the real face image if available, drawn oval otherwise.
+        """
         c     = self.c
         x, y  = self.cx, self.cy
         f     = self.frame
         s     = self.state
 
-        phase    = (f / NFRAMES) * 2 * math.pi
-        moving   = s in (State.WALKL, State.WALKR, State.RUNL, State.RUNR)
-        running  = s in (State.RUNL, State.RUNR)
-        waving   = s == State.WAVE
-
-        swing      = 32 if running else (22 if moving else 0)
-        bob_amp    =  4 if running else ( 2 if moving else 0)
-        leg_swing  = math.sin(phase) * swing
-        body_bob   = (abs(math.sin(phase)) * bob_amp if moving
-                      else math.sin(phase * 0.5) * 1.2)
-
-        hip_y       = y - 4
-        waist_y     = y - 42
-        shoulder_y  = y - 72 - int(body_bob)
-        head_y      = y - 96 - int(body_bob)
-        HR          = 16
-
+        phase      = (f / NFRAMES) * 2 * math.pi
+        moving     = s in (State.WALKL, State.WALKR, State.RUNL, State.RUNR)
+        running    = s in (State.RUNL,  State.RUNR)
+        waving     = s == State.WAVE
         going_right = s in (State.WALKR, State.RUNR)
+        going_left  = s in (State.WALKL, State.RUNL)
+
+        swing     = 36 if running else (25 if moving else 0)
+        bob_amp   =  6 if running else ( 3 if moving else 0)
+        leg_swing = math.sin(phase) * swing
+        body_bob  = (abs(math.sin(phase)) * bob_amp if moving
+                     else math.sin(phase * 0.5) * 1.5)
+
+        # Key Y positions measured up from feet
+        hip_y      = y - 6
+        waist_y    = y - 55
+        shoulder_y = y - 95 - int(body_bob)
+        head_cy    = y - 128 - int(body_bob)   # centre of head
 
         def leg_pts(hip_x: int, angle_deg: float):
             a  = math.radians(angle_deg)
-            kx = hip_x + math.sin(a) * 22
-            ky = hip_y + math.cos(a) * 22
-            a2 = math.radians(angle_deg * 0.3)
-            return int(kx), int(ky), int(kx + math.sin(a2)*22), int(ky + math.cos(a2)*22)
+            ul, ll = 28, 30                     # upper / lower leg lengths
+            kx = hip_x + math.sin(a) * ul
+            ky = hip_y + math.cos(a) * ul
+            a2 = math.radians(angle_deg * 0.35)
+            return int(kx), int(ky), int(kx + math.sin(a2)*ll), int(ky + math.cos(a2)*ll)
 
         def arm_pts(sh_x: int, angle_deg: float):
             a  = math.radians(angle_deg)
-            ex = sh_x + math.sin(a) * 16
-            ey = shoulder_y + math.cos(a) * 16
+            ua, la = 20, 18
+            ex = sh_x + math.sin(a) * ua
+            ey = shoulder_y + math.cos(a) * ua
             a2 = math.radians(angle_deg * 0.5)
-            return int(ex), int(ey), int(ex + math.sin(a2)*14), int(ey + math.cos(a2)*14)
+            return int(ex), int(ey), int(ex + math.sin(a2)*la), int(ey + math.cos(a2)*la)
 
-        lkx,lky,lfx,lfy = leg_pts(x-8,  leg_swing)
-        rkx,rky,rfx,rfy = leg_pts(x+8, -leg_swing)
+        lkx,lky,lfx,lfy = leg_pts(x - 10,  leg_swing)
+        rkx,rky,rfx,rfy = leg_pts(x + 10, -leg_swing)
         arm_sw = -leg_swing * 0.65
-        lex,ley,lhx,lhy = arm_pts(x-14,  arm_sw + 10)
-        rex,rey,rhx,rhy = arm_pts(x+14, -arm_sw - 10)
+        lex,ley,lhx,lhy = arm_pts(x - 18,  arm_sw + 12)
+        rex,rey,rhx,rhy = arm_pts(x + 18, -arm_sw - 12)
 
         def draw_leg(hx, kx, ky, fx, fy):
-            self._put(c.create_line(hx,hip_y,kx,ky,fx,fy,
-                fill=C_PANTS,width=8,smooth=True,joinstyle=tk.ROUND,capstyle=tk.ROUND))
-            self._put(c.create_oval(fx-9,fy-5,fx+9,fy+4,fill=C_SHOE,outline=''))
+            self._put(c.create_line(hx, hip_y, kx, ky, fx, fy,
+                fill=C_PANTS, width=11, smooth=True, joinstyle=tk.ROUND, capstyle=tk.ROUND))
+            self._put(c.create_oval(fx-11, fy-6, fx+11, fy+5,
+                fill=C_SHOE, outline='#111', width=1))
 
         def draw_arm(sh_x, ex, ey, hx, hy):
-            self._put(c.create_line(sh_x,shoulder_y,ex,ey,hx,hy,
-                fill=C_SKIN,width=6,smooth=True,joinstyle=tk.ROUND,capstyle=tk.ROUND))
+            self._put(c.create_line(sh_x, shoulder_y, ex, ey, hx, hy,
+                fill=C_SKIN, width=9, smooth=True, joinstyle=tk.ROUND, capstyle=tk.ROUND))
+
+        # === Draw order: back → front ===
 
         # Back leg
-        if going_right: draw_leg(x+8,rkx,rky,rfx,rfy)
-        else:           draw_leg(x-8,lkx,lky,lfx,lfy)
+        if going_right: draw_leg(x+10, rkx, rky, rfx, rfy)
+        else:           draw_leg(x-10, lkx, lky, lfx, lfy)
 
-        # Body
+        # Kurta body
         self._put(c.create_polygon(
-            x-18,shoulder_y, x+18,shoulder_y,
-            x+16,waist_y,    x+12,hip_y,
-            x-12,hip_y,      x-16,waist_y,
-            fill=C_KURTA, outline='#DDDDDD', width=1, smooth=True
+            x-24, shoulder_y,  x+24, shoulder_y,
+            x+20, waist_y,     x+16, hip_y,
+            x-16, hip_y,       x-20, waist_y,
+            fill=C_KURTA, outline='#CCCCCC', width=1, smooth=True
         ))
+        # Kurta centre seam
+        self._put(c.create_line(x, shoulder_y+2, x, waist_y-2,
+                                fill='#DDDDDD', width=1, dash=(3, 5)))
 
         # Front leg
-        if going_right: draw_leg(x-8,lkx,lky,lfx,lfy)
-        else:           draw_leg(x+8,rkx,rky,rfx,rfy)
+        if going_right: draw_leg(x-10, lkx, lky, lfx, lfy)
+        else:           draw_leg(x+10, rkx, rky, rfx, rfy)
 
         # Back arm
-        if going_right: draw_arm(x+14,rex,rey,rhx,rhy)
-        else:           draw_arm(x-14,lex,ley,lhx,lhy)
+        if going_right: draw_arm(x+18, rex, rey, rhx, rhy)
+        else:           draw_arm(x-18, lex, ley, lhx, lhy)
 
-        # Scarf
-        self._put(c.create_line(x-14,shoulder_y+2,x+4,shoulder_y+8,x+18,shoulder_y-2,
-                                fill=C_SCARF,width=4,smooth=True))
+        # Saffron scarf
+        self._put(c.create_line(
+            x-20, shoulder_y+2,  x+2, shoulder_y+12,  x+24, shoulder_y-2,
+            fill=C_SCARF, width=6, smooth=True))
 
         # Neck
-        self._put(c.create_rectangle(x-5,head_y+HR-2,x+5,shoulder_y+2,
-                                     fill=C_SKIN,outline=''))
-        # Head
-        self._put(c.create_oval(x-HR,head_y-HR,x+HR,head_y+HR,
-                                fill=C_SKIN,outline='#D9A870',width=1))
-        # Hair
-        self._put(c.create_arc(x-HR,head_y-HR,x+HR,head_y+4,
-                               start=0,extent=180,fill=C_HAIR,outline='#CCCCCC',width=1))
-        # Eyes
-        for dx in (-6, 6):
-            self._put(c.create_oval(x+dx-4,head_y-5,x+dx+4,head_y+3,
-                                    fill='white',outline='#999',width=1))
-            self._put(c.create_oval(x+dx-2,head_y-3,x+dx+2,head_y+1,fill=C_EYE_P))
-        # Mustache
-        for side in (-1, 1):
-            mx = x + side*6
-            self._put(c.create_arc(mx-7,head_y+3,mx+7,head_y+12,
-                                   start=180,extent=180,fill=C_BEARD,outline='#BBBBBB',width=1))
-        # Beard
-        self._put(c.create_arc(x-13,head_y-1,x+13,head_y+HR+10,
-                               start=200,extent=140,fill=C_BEARD,outline='#CCCCCC',width=1))
+        self._put(c.create_rectangle(x-7, head_cy + HR - 2, x+7, shoulder_y+2,
+                                     fill=C_SKIN, outline=''))
 
-        # Front arm / wave
+        # ---- HEAD ----
+        if self._face_r:
+            # Real Modi face centred at head_cy
+            face_img = self._face_l if going_left else self._face_r
+            self._put(c.create_image(x, head_cy + self._face_h // 2,
+                                     image=face_img, anchor='s'))
+        else:
+            # Drawn fallback head
+            self._put(c.create_oval(x-HR, head_cy-HR, x+HR, head_cy+HR,
+                                    fill=C_SKIN, outline='#D9A870', width=1))
+            self._put(c.create_arc(x-HR, head_cy-HR, x+HR, head_cy+5,
+                                   start=0, extent=180, fill=C_HAIR, outline='#CCCCCC'))
+            for dx in (-7, 7):
+                self._put(c.create_oval(x+dx-5, head_cy-7, x+dx+5, head_cy+3,
+                                        fill='white', outline='#999', width=1))
+                self._put(c.create_oval(x+dx-2, head_cy-4, x+dx+2, head_cy+1, fill=C_EYE_P))
+            for side in (-1, 1):
+                mx = x + side*7
+                self._put(c.create_arc(mx-8, head_cy+3, mx+8, head_cy+14,
+                                       start=180, extent=180, fill=C_BEARD, outline='#BBBBBB'))
+            self._put(c.create_arc(x-14, head_cy, x+14, head_cy+HR+14,
+                                   start=200, extent=140, fill=C_BEARD, outline='#CCCCCC'))
+
+        # Front arm (or waving arm)
         if waving:
-            wa = -55 + math.sin(phase*2)*30
-            wex,wey,whx,why = arm_pts(x-14,wa)
-            draw_arm(x-14,wex,wey,whx,why)
-            draw_arm(x+14,rex,rey,rhx,rhy)
-        elif going_right: draw_arm(x-14,lex,ley,lhx,lhy)
-        else:             draw_arm(x+14,rex,rey,rhx,rhy)
+            wa = -65 + math.sin(phase * 2) * 40
+            wex, wey, whx, why = arm_pts(x - 18, wa)
+            draw_arm(x - 18, wex, wey, whx, why)
+            draw_arm(x + 18, rex, rey, rhx, rhy)
+        elif going_right: draw_arm(x - 18, lex, ley, lhx, lhy)
+        else:             draw_arm(x + 18, rex, rey, rhx, rhy)
 
 
 # ---------------------------------------------------------------------------
@@ -343,21 +318,9 @@ class ModiApp:
                                 bg=CHROMA, highlightthickness=0, bd=0)
         self.canvas.pack()
 
-        # Create sprite — it may load an image and report its size
-        self.sprite = Sprite(self.canvas, WIN_W // 2, WIN_H - 12)
-
-        # Resize window / canvas to match loaded image (if any)
-        self._win_w = WIN_W
-        self._win_h = WIN_H
-        if self.sprite.has_image():
-            iw = self.sprite.img_w
-            ih = self.sprite.img_h + 12          # 12 px padding at bottom
-            self._win_w = iw
-            self._win_h = ih
-            self.sprite.cx = iw // 2
-            self.sprite.cy = ih - 6
-            self.canvas.config(width=iw, height=ih)
-            self.root.geometry(f'{iw}x{ih}')
+        self.sprite  = Sprite(self.canvas, WIN_W // 2, WIN_H - 12)
+        self._win_w  = WIN_W
+        self._win_h  = WIN_H
 
         # Screen position — bottom-right quadrant
         sw = self.root.winfo_screenwidth()
