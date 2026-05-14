@@ -30,6 +30,12 @@ try:
 except ImportError:
     HAS_PYSTRAY = False
 
+try:
+    import pyttsx3
+    HAS_TTS = True
+except ImportError:
+    HAS_TTS = False
+
 # ---------------------------------------------------------------------------
 # Config — drawn-fallback defaults (overridden dynamically when image loads)
 # ---------------------------------------------------------------------------
@@ -97,6 +103,10 @@ class Sprite:
         self._face_w = 0
         self._face_h = 0
 
+        # Speech bubble
+        self._bubble_text  = ''
+        self._bubble_visible = False
+
         self._load_face()
 
     # -- public API --
@@ -110,6 +120,48 @@ class Sprite:
 
     def set_state(self, s: State):
         self.state = s
+
+    def show_bubble(self, text: str):
+        self._bubble_text    = text
+        self._bubble_visible = True
+
+    def hide_bubble(self):
+        self._bubble_visible = False
+
+    def _draw_bubble(self, c, x: int, tip_y: int, text: str):
+        """Speech bubble with tail pointing down to character head."""
+        font  = ('Arial', 12, 'bold')
+        bw, bh = 80, 34
+        bx = x - bw // 2
+        by = tip_y - bh - 14        # bubble sits above tip
+        r  = 8                       # corner radius
+
+        # Rounded rectangle (simulated with overlapping shapes)
+        self._put(c.create_rectangle(bx + r, by, bx + bw - r, by + bh,
+                                     fill='#FFFDE7', outline=''))
+        self._put(c.create_rectangle(bx, by + r, bx + bw, by + bh - r,
+                                     fill='#FFFDE7', outline=''))
+        for cx2, cy2 in [(bx+r, by+r), (bx+bw-r, by+r),
+                          (bx+r, by+bh-r), (bx+bw-r, by+bh-r)]:
+            self._put(c.create_oval(cx2-r, cy2-r, cx2+r, cy2+r,
+                                    fill='#FFFDE7', outline=''))
+        # Border
+        self._put(c.create_arc(bx,      by,      bx+2*r,  by+2*r,  start=90,  extent=90,  style=tk.ARC, outline='#555', width=2))
+        self._put(c.create_arc(bx+bw-2*r, by,    bx+bw,   by+2*r,  start=0,   extent=90,  style=tk.ARC, outline='#555', width=2))
+        self._put(c.create_arc(bx,      by+bh-2*r, bx+2*r, by+bh,  start=180, extent=90,  style=tk.ARC, outline='#555', width=2))
+        self._put(c.create_arc(bx+bw-2*r, by+bh-2*r, bx+bw, by+bh, start=270, extent=90,  style=tk.ARC, outline='#555', width=2))
+        self._put(c.create_line(bx+r, by,     bx+bw-r, by,     fill='#555', width=2))
+        self._put(c.create_line(bx+r, by+bh,  bx+bw-r, by+bh,  fill='#555', width=2))
+        self._put(c.create_line(bx,   by+r,   bx,      by+bh-r, fill='#555', width=2))
+        self._put(c.create_line(bx+bw, by+r,  bx+bw,   by+bh-r, fill='#555', width=2))
+        # Tail triangle
+        self._put(c.create_polygon(x-8, by+bh, x+8, by+bh, x, tip_y,
+                                   fill='#FFFDE7', outline='#555', width=2))
+        # Cover tail base edges with fill colour
+        self._put(c.create_line(x-7, by+bh, x+7, by+bh, fill='#FFFDE7', width=3))
+        # Text
+        self._put(c.create_text(x, by + bh // 2, text=text,
+                                font=font, fill='#B71C1C'))
 
     # -- face extraction --
 
@@ -125,7 +177,7 @@ class Sprite:
         if not candidates:
             return
 
-        preferred = ['modi.png', 'character.png', 'sprite.png']
+        preferred = ['modi-2-old.png', 'modi.png', 'character.png', 'sprite.png']
         chosen = next((f for f in preferred if f in candidates), candidates[0])
         path   = os.path.join(ASSETS_DIR, chosen)
 
@@ -304,6 +356,10 @@ class Sprite:
         elif going_right: draw_arm(x - 18, lex, ley, lhx, lhy)
         else:             draw_arm(x + 18, rex, rey, rhx, rhy)
 
+        # Speech bubble (drawn last so it's on top of everything)
+        if self._bubble_visible and self._bubble_text:
+            self._draw_bubble(c, x, head_cy - HR - 2, self._bubble_text)
+
 
 # ---------------------------------------------------------------------------
 # Main application
@@ -342,9 +398,14 @@ class ModiApp:
         self._ai_steps   = 0
         self._ai_target  = random.randint(60, 200)
 
-        self.tray = None
+        self.tray         = None
+        self._voice_engine = None
+        self._speaking    = False
+
         self._bind_events()
         self._setup_tray()
+        self._setup_voice()
+        self._schedule_mitro()
 
     # -- window --
 
@@ -380,6 +441,8 @@ class ModiApp:
         r.bind('<Up>',     lambda e: self._kbd_move( 0, -1))
         r.bind('<Down>',   lambda e: self._kbd_move( 0,  1))
         r.bind('<space>',  lambda e: self._do_wave())
+        r.bind('<m>',      lambda e: self._say_mitro())
+        r.bind('<M>',      lambda e: self._say_mitro())
         r.bind('<Escape>', lambda e: self.quit())
         r.bind('<q>',      lambda e: self.quit())
 
@@ -413,9 +476,10 @@ class ModiApp:
 
     def _context_menu(self, e):
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label='Wave',      command=self._do_wave)
+        menu.add_command(label='Say Mitro!', command=self._say_mitro)
+        menu.add_command(label='Wave',       command=self._do_wave)
         menu.add_separator()
-        menu.add_command(label='Quit Modi', command=self.quit)
+        menu.add_command(label='Quit Modi',  command=self.quit)
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -497,6 +561,51 @@ class ModiApp:
         icon = pystray.Icon('Modi', img, 'Modi Character', menu)
         threading.Thread(target=icon.run, daemon=True).start()
         self.tray = icon
+
+    # -- voice --
+
+    def _setup_voice(self):
+        if not HAS_TTS:
+            return
+        try:
+            engine = pyttsx3.init()
+            # Slow, deep rate to match Modi's deliberate speaking style
+            engine.setProperty('rate',   105)
+            engine.setProperty('volume', 1.0)
+            # Prefer male voice (David)
+            for v in engine.getProperty('voices'):
+                if 'david' in v.name.lower():
+                    engine.setProperty('voice', v.id)
+                    break
+            self._voice_engine = engine
+        except Exception:
+            self._voice_engine = None
+
+    def _say_mitro(self):
+        """Show speech bubble and speak 'Mitro' in Modi's voice."""
+        self.sprite.show_bubble("Mitro!")
+        self.root.after(2800, self.sprite.hide_bubble)
+
+        if self._voice_engine and not self._speaking:
+            self._speaking = True
+            def _speak():
+                try:
+                    self._voice_engine.say("Mitro")
+                    self._voice_engine.runAndWait()
+                except Exception:
+                    pass
+                finally:
+                    self._speaking = False
+            threading.Thread(target=_speak, daemon=True).start()
+
+    def _schedule_mitro(self):
+        """Randomly say Mitro every 15–40 seconds automatically."""
+        interval = random.randint(15_000, 40_000)
+        self.root.after(interval, self._auto_mitro)
+
+    def _auto_mitro(self):
+        self._say_mitro()
+        self._schedule_mitro()
 
     # -- lifecycle --
 
