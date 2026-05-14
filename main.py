@@ -2,9 +2,15 @@
 """
 Modi Desktop Character
 Transparent, always-on-top animated desktop companion.
+
+To use a real image: drop any PNG with transparent background into assets/
+  Preferred filename: assets/modi.png  (facing RIGHT in the image)
+  The app auto-detects any .png in that folder as a fallback.
+
 Run: python main.py
 """
 
+import os
 import tkinter as tk
 import math
 import random
@@ -12,7 +18,7 @@ import threading
 from enum import Enum
 
 try:
-    from PIL import Image, ImageDraw, ImageTk
+    from PIL import Image, ImageDraw, ImageOps, ImageTk
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -24,29 +30,28 @@ except ImportError:
     HAS_PYSTRAY = False
 
 # ---------------------------------------------------------------------------
-# Config
+# Config — drawn-fallback defaults (overridden dynamically when image loads)
 # ---------------------------------------------------------------------------
-WIN_W, WIN_H = 120, 165          # Overlay window dimensions (px)
-CX = WIN_W // 2                   # Character center X on canvas
-CY = WIN_H - 12                   # Character feet Y on canvas
+WIN_W, WIN_H = 120, 165
+CHROMA       = '#00FF00'   # pixels of this exact colour → transparent on Windows
+FPS          = 16
+ANIM_MS      = 1000 // FPS
+WALK_SPEED   = 2           # px per frame
 
-CHROMA = '#00FF00'                # Window pixels of this color → transparent
-
-FPS = 16
-ANIM_MS = 1000 // FPS
-WALK_SPEED = 2                    # px per frame
-
-# Character palette (none should equal CHROMA)
+# Drawn-character palette (none may equal CHROMA)
 C_SKIN  = '#F4C68F'
-C_HAIR  = '#F0F0F0'               # Modi's white hair
-C_KURTA = '#FFFFFF'               # White kurta
+C_HAIR  = '#F0F0F0'
+C_KURTA = '#FFFFFF'
 C_PANTS = '#F0F0F8'
-C_SCARF = '#FF8800'               # Saffron
+C_SCARF = '#FF8800'
 C_SHOE  = '#1A1A1A'
 C_BEARD = '#EFEFEF'
 C_EYE_P = '#111111'
 
-NFRAMES = 8                       # Animation frames per cycle
+NFRAMES      = 8
+ASSETS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+IMG_MAX_W    = 180         # max image width when resizing
+IMG_MAX_H    = 260         # max image height when resizing
 
 
 # ---------------------------------------------------------------------------
@@ -62,20 +67,40 @@ class State(Enum):
 
 
 # ---------------------------------------------------------------------------
-# Sprite — draws Modi on a Canvas using geometric shapes
+# Sprite
 # ---------------------------------------------------------------------------
 class Sprite:
     """
-    Renders a cartoon Modi character frame-by-frame onto a tkinter Canvas.
-    Character feet are anchored at (CX, CY).
-    Replace _render() with sprite-sheet logic when real PNGs are available.
+    Renders Modi on a tkinter Canvas.
+
+    Image mode  — loads assets/modi.png (or first .png found), resizes it,
+                  mirrors for left-facing, adds a walk-bob effect.
+    Drawn mode  — fallback geometric character when no PNG is present.
+
+    To switch to real sprites later: drop PNG(s) into assets/ and restart.
+    Character should face RIGHT in the source image.
     """
 
-    def __init__(self, canvas: tk.Canvas):
-        self.c = canvas
+    def __init__(self, canvas: tk.Canvas, cx: int, cy: int):
+        self.c   = canvas
+        self.cx  = cx
+        self.cy  = cy
         self.state = State.IDLE
         self.frame = 0
         self._ids: list[int] = []
+
+        # Image references (kept alive to avoid GC)
+        self._img_r: ImageTk.PhotoImage | None = None   # facing right
+        self._img_l: ImageTk.PhotoImage | None = None   # facing left (mirrored)
+        self.img_w  = 0
+        self.img_h  = 0
+
+        self._load_sprite_image()
+
+    # -- public API --
+
+    def has_image(self) -> bool:
+        return self._img_r is not None
 
     def advance(self):
         self.frame = (self.frame + 1) % NFRAMES
@@ -84,7 +109,35 @@ class Sprite:
     def set_state(self, s: State):
         self.state = s
 
-    # -- internals --
+    # -- image loading --
+
+    def _load_sprite_image(self):
+        if not HAS_PIL:
+            return
+        try:
+            candidates = [f for f in os.listdir(ASSETS_DIR)
+                          if f.lower().endswith('.png') and not f.startswith('.')]
+        except OSError:
+            return
+        if not candidates:
+            return
+
+        preferred = ['modi.png', 'character.png', 'sprite.png']
+        chosen = next((f for f in preferred if f in candidates), candidates[0])
+        path   = os.path.join(ASSETS_DIR, chosen)
+
+        try:
+            img = Image.open(path).convert('RGBA')
+            img.thumbnail((IMG_MAX_W, IMG_MAX_H), Image.LANCZOS)
+            self.img_w = img.width
+            self.img_h = img.height
+            self._img_r = ImageTk.PhotoImage(img)
+            self._img_l = ImageTk.PhotoImage(ImageOps.mirror(img))
+            print(f"Sprite loaded: {chosen}  ({img.width} × {img.height} px)")
+        except Exception as exc:
+            print(f"Warning — could not load sprite image: {exc}")
+
+    # -- rendering --
 
     def _clear(self):
         for i in self._ids:
@@ -96,148 +149,149 @@ class Sprite:
 
     def _render(self):
         self._clear()
-        c = self.c
-        x, y = CX, CY
-        f = self.frame
-        s = self.state
+        if self.has_image():
+            self._render_image()
+        else:
+            self._render_drawn()
+
+    # -- image-based render --
+
+    def _render_image(self):
+        c     = self.c
+        x, y  = self.cx, self.cy
+        f     = self.frame
+        s     = self.state
+
+        phase   = (f / NFRAMES) * 2 * math.pi
+        moving  = s in (State.WALKL, State.WALKR, State.RUNL, State.RUNR)
+        waving  = s == State.WAVE
+        go_left = s in (State.WALKL, State.RUNL)
+
+        # Subtle vertical bob while walking / running
+        bob_y = int(abs(math.sin(phase)) * 4) if moving else 0
+
+        img_ref = self._img_l if go_left else self._img_r
+        self._put(c.create_image(x, y - bob_y, image=img_ref, anchor='s'))
+
+        # Waving overlay: animated arc above character
+        if waving:
+            wx = x - self.img_w // 4 + int(math.sin(phase * 2) * 12)
+            wy = y - self.img_h + int(math.cos(phase * 2) * 10) + 10
+            self._put(c.create_arc(wx - 14, wy - 14, wx + 14, wy + 14,
+                                   start=0, extent=270,
+                                   outline=C_SCARF, width=4, style=tk.ARC))
+
+    # -- drawn-fallback render --
+
+    def _render_drawn(self):
+        c     = self.c
+        x, y  = self.cx, self.cy
+        f     = self.frame
+        s     = self.state
 
         phase    = (f / NFRAMES) * 2 * math.pi
         moving   = s in (State.WALKL, State.WALKR, State.RUNL, State.RUNR)
         running  = s in (State.RUNL, State.RUNR)
         waving   = s == State.WAVE
 
-        swing    = 32 if running else (22 if moving else 0)
-        bob_amp  =  4 if running else ( 2 if moving else 0)
+        swing      = 32 if running else (22 if moving else 0)
+        bob_amp    =  4 if running else ( 2 if moving else 0)
+        leg_swing  = math.sin(phase) * swing
+        body_bob   = (abs(math.sin(phase)) * bob_amp if moving
+                      else math.sin(phase * 0.5) * 1.2)
 
-        leg_swing = math.sin(phase) * swing
-        body_bob  = abs(math.sin(phase)) * bob_amp if moving else math.sin(phase * 0.5) * 1.2
-
-        # Key Y positions (measured upward from feet)
-        hip_y      = y - 4
-        waist_y    = y - 42
-        shoulder_y = y - 72 - int(body_bob)
-        head_y     = y - 96 - int(body_bob)
-        HR         = 16                          # head radius
+        hip_y       = y - 4
+        waist_y     = y - 42
+        shoulder_y  = y - 72 - int(body_bob)
+        head_y      = y - 96 - int(body_bob)
+        HR          = 16
 
         going_right = s in (State.WALKR, State.RUNR)
 
         def leg_pts(hip_x: int, angle_deg: float):
             a  = math.radians(angle_deg)
-            ul, ll = 22, 22
-            kx = hip_x + math.sin(a) * ul
-            ky = hip_y + math.cos(a) * ul
+            kx = hip_x + math.sin(a) * 22
+            ky = hip_y + math.cos(a) * 22
             a2 = math.radians(angle_deg * 0.3)
-            fx = kx + math.sin(a2) * ll
-            fy = ky + math.cos(a2) * ll
-            return int(kx), int(ky), int(fx), int(fy)
+            return int(kx), int(ky), int(kx + math.sin(a2)*22), int(ky + math.cos(a2)*22)
 
         def arm_pts(sh_x: int, angle_deg: float):
             a  = math.radians(angle_deg)
-            ua, la = 16, 14
-            ex = sh_x + math.sin(a) * ua
-            ey = shoulder_y + math.cos(a) * ua
+            ex = sh_x + math.sin(a) * 16
+            ey = shoulder_y + math.cos(a) * 16
             a2 = math.radians(angle_deg * 0.5)
-            hx = ex + math.sin(a2) * la
-            hy = ey + math.cos(a2) * la
-            return int(ex), int(ey), int(hx), int(hy)
+            return int(ex), int(ey), int(ex + math.sin(a2)*14), int(ey + math.cos(a2)*14)
 
-        lkx, lky, lfx, lfy = leg_pts(x - 8,  leg_swing)
-        rkx, rky, rfx, rfy = leg_pts(x + 8, -leg_swing)
-
-        arm_swing = -leg_swing * 0.65
-        lex, ley, lhx, lhy = arm_pts(x - 14,  arm_swing + 10)
-        rex, rey, rhx, rhy = arm_pts(x + 14, -arm_swing - 10)
+        lkx,lky,lfx,lfy = leg_pts(x-8,  leg_swing)
+        rkx,rky,rfx,rfy = leg_pts(x+8, -leg_swing)
+        arm_sw = -leg_swing * 0.65
+        lex,ley,lhx,lhy = arm_pts(x-14,  arm_sw + 10)
+        rex,rey,rhx,rhy = arm_pts(x+14, -arm_sw - 10)
 
         def draw_leg(hx, kx, ky, fx, fy):
-            self._put(c.create_line(hx, hip_y, kx, ky, fx, fy,
-                                    fill=C_PANTS, width=8, smooth=True,
-                                    joinstyle=tk.ROUND, capstyle=tk.ROUND))
-            self._put(c.create_oval(fx - 9, fy - 5, fx + 9, fy + 4,
-                                    fill=C_SHOE, outline=''))
+            self._put(c.create_line(hx,hip_y,kx,ky,fx,fy,
+                fill=C_PANTS,width=8,smooth=True,joinstyle=tk.ROUND,capstyle=tk.ROUND))
+            self._put(c.create_oval(fx-9,fy-5,fx+9,fy+4,fill=C_SHOE,outline=''))
 
         def draw_arm(sh_x, ex, ey, hx, hy):
-            self._put(c.create_line(sh_x, shoulder_y, ex, ey, hx, hy,
-                                    fill=C_SKIN, width=6, smooth=True,
-                                    joinstyle=tk.ROUND, capstyle=tk.ROUND))
-
-        # === Draw order: back-to-front ===
+            self._put(c.create_line(sh_x,shoulder_y,ex,ey,hx,hy,
+                fill=C_SKIN,width=6,smooth=True,joinstyle=tk.ROUND,capstyle=tk.ROUND))
 
         # Back leg
-        if going_right:
-            draw_leg(x + 8, rkx, rky, rfx, rfy)
-        else:
-            draw_leg(x - 8, lkx, lky, lfx, lfy)
+        if going_right: draw_leg(x+8,rkx,rky,rfx,rfy)
+        else:           draw_leg(x-8,lkx,lky,lfx,lfy)
 
-        # Kurta body
+        # Body
         self._put(c.create_polygon(
-            x - 18, shoulder_y,  x + 18, shoulder_y,
-            x + 16, waist_y,     x + 12, hip_y,
-            x - 12, hip_y,       x - 16, waist_y,
+            x-18,shoulder_y, x+18,shoulder_y,
+            x+16,waist_y,    x+12,hip_y,
+            x-12,hip_y,      x-16,waist_y,
             fill=C_KURTA, outline='#DDDDDD', width=1, smooth=True
         ))
 
         # Front leg
-        if going_right:
-            draw_leg(x - 8, lkx, lky, lfx, lfy)
-        else:
-            draw_leg(x + 8, rkx, rky, rfx, rfy)
+        if going_right: draw_leg(x-8,lkx,lky,lfx,lfy)
+        else:           draw_leg(x+8,rkx,rky,rfx,rfy)
 
         # Back arm
-        if going_right:
-            draw_arm(x + 14, rex, rey, rhx, rhy)
-        else:
-            draw_arm(x - 14, lex, ley, lhx, lhy)
+        if going_right: draw_arm(x+14,rex,rey,rhx,rhy)
+        else:           draw_arm(x-14,lex,ley,lhx,lhy)
 
-        # Saffron scarf drape
-        self._put(c.create_line(
-            x - 14, shoulder_y + 2,
-            x +  4, shoulder_y + 8,
-            x + 18, shoulder_y - 2,
-            fill=C_SCARF, width=4, smooth=True
-        ))
+        # Scarf
+        self._put(c.create_line(x-14,shoulder_y+2,x+4,shoulder_y+8,x+18,shoulder_y-2,
+                                fill=C_SCARF,width=4,smooth=True))
 
         # Neck
-        self._put(c.create_rectangle(x - 5, head_y + HR - 2, x + 5, shoulder_y + 2,
-                                     fill=C_SKIN, outline=''))
-
+        self._put(c.create_rectangle(x-5,head_y+HR-2,x+5,shoulder_y+2,
+                                     fill=C_SKIN,outline=''))
         # Head
-        self._put(c.create_oval(x - HR, head_y - HR, x + HR, head_y + HR,
-                                fill=C_SKIN, outline='#D9A870', width=1))
-
-        # White hair
-        self._put(c.create_arc(x - HR, head_y - HR, x + HR, head_y + 4,
-                               start=0, extent=180,
-                               fill=C_HAIR, outline='#CCCCCC', width=1))
-
+        self._put(c.create_oval(x-HR,head_y-HR,x+HR,head_y+HR,
+                                fill=C_SKIN,outline='#D9A870',width=1))
+        # Hair
+        self._put(c.create_arc(x-HR,head_y-HR,x+HR,head_y+4,
+                               start=0,extent=180,fill=C_HAIR,outline='#CCCCCC',width=1))
         # Eyes
         for dx in (-6, 6):
-            self._put(c.create_oval(x + dx - 4, head_y - 5, x + dx + 4, head_y + 3,
-                                    fill='white', outline='#999', width=1))
-            self._put(c.create_oval(x + dx - 2, head_y - 3, x + dx + 2, head_y + 1,
-                                    fill=C_EYE_P))
-
-        # Mustache (two arcs)
+            self._put(c.create_oval(x+dx-4,head_y-5,x+dx+4,head_y+3,
+                                    fill='white',outline='#999',width=1))
+            self._put(c.create_oval(x+dx-2,head_y-3,x+dx+2,head_y+1,fill=C_EYE_P))
+        # Mustache
         for side in (-1, 1):
-            mx = x + side * 6
-            self._put(c.create_arc(mx - 7, head_y + 3, mx + 7, head_y + 12,
-                                   start=180, extent=180,
-                                   fill=C_BEARD, outline='#BBBBBB', width=1))
-
+            mx = x + side*6
+            self._put(c.create_arc(mx-7,head_y+3,mx+7,head_y+12,
+                                   start=180,extent=180,fill=C_BEARD,outline='#BBBBBB',width=1))
         # Beard
-        self._put(c.create_arc(x - 13, head_y - 1, x + 13, head_y + HR + 10,
-                               start=200, extent=140,
-                               fill=C_BEARD, outline='#CCCCCC', width=1))
+        self._put(c.create_arc(x-13,head_y-1,x+13,head_y+HR+10,
+                               start=200,extent=140,fill=C_BEARD,outline='#CCCCCC',width=1))
 
-        # Front arm (or waving arm)
+        # Front arm / wave
         if waving:
-            wave_angle = -55 + math.sin(phase * 2) * 30
-            wex, wey, whx, why = arm_pts(x - 14, wave_angle)
-            draw_arm(x - 14, wex, wey, whx, why)
-            draw_arm(x + 14, rex, rey, rhx, rhy)
-        elif going_right:
-            draw_arm(x - 14, lex, ley, lhx, lhy)
-        else:
-            draw_arm(x + 14, rex, rey, rhx, rhy)
+            wa = -55 + math.sin(phase*2)*30
+            wex,wey,whx,why = arm_pts(x-14,wa)
+            draw_arm(x-14,wex,wey,whx,why)
+            draw_arm(x+14,rex,rey,rhx,rhy)
+        elif going_right: draw_arm(x-14,lex,ley,lhx,lhy)
+        else:             draw_arm(x+14,rex,rey,rhx,rhy)
 
 
 # ---------------------------------------------------------------------------
@@ -248,17 +302,32 @@ class ModiApp:
         self.root = tk.Tk()
         self._init_window()
 
+        # Build canvas at drawn-character size first
         self.canvas = tk.Canvas(self.root, width=WIN_W, height=WIN_H,
                                 bg=CHROMA, highlightthickness=0, bd=0)
         self.canvas.pack()
 
-        self.sprite = Sprite(self.canvas)
+        # Create sprite — it may load an image and report its size
+        self.sprite = Sprite(self.canvas, WIN_W // 2, WIN_H - 12)
 
-        # Window screen position
+        # Resize window / canvas to match loaded image (if any)
+        self._win_w = WIN_W
+        self._win_h = WIN_H
+        if self.sprite.has_image():
+            iw = self.sprite.img_w
+            ih = self.sprite.img_h + 12          # 12 px padding at bottom
+            self._win_w = iw
+            self._win_h = ih
+            self.sprite.cx = iw // 2
+            self.sprite.cy = ih - 6
+            self.canvas.config(width=iw, height=ih)
+            self.root.geometry(f'{iw}x{ih}')
+
+        # Screen position — bottom-right quadrant
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        self._wx = sw - WIN_W - 60
-        self._wy = sh - WIN_H - 80
+        self._wx = sw - self._win_w - 60
+        self._wy = sh - self._win_h - 80
         self._clamp_pos(sw, sh)
         self._apply_pos()
 
@@ -268,22 +337,22 @@ class ModiApp:
         self._dragging = False
 
         # AI state
-        self._ai_paused = False
-        self.visible = True
-        self._ai_dir = random.choice([State.WALKL, State.WALKR])
-        self._ai_steps = 0
-        self._ai_target = random.randint(60, 200)
+        self._ai_paused  = False
+        self.visible     = True
+        self._ai_dir     = random.choice([State.WALKL, State.WALKR])
+        self._ai_steps   = 0
+        self._ai_target  = random.randint(60, 200)
 
         self.tray = None
         self._bind_events()
         self._setup_tray()
 
-    # -- window setup --
+    # -- window --
 
     def _init_window(self):
         r = self.root
-        r.overrideredirect(True)            # borderless
-        r.attributes('-topmost', True)      # always on top
+        r.overrideredirect(True)
+        r.attributes('-topmost', True)
         r.attributes('-transparentcolor', CHROMA)
         r.config(bg=CHROMA)
         r.title('Modi Character')
@@ -295,8 +364,8 @@ class ModiApp:
         if sw is None:
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
-        self._wx = max(0, min(sw - WIN_W, self._wx))
-        self._wy = max(0, min(sh - WIN_H, self._wy))
+        self._wx = max(0, min(sw - self._win_w, self._wx))
+        self._wy = max(0, min(sh - self._win_h, self._wy))
 
     # -- event bindings --
 
@@ -338,10 +407,8 @@ class ModiApp:
         self._wy += dy * 25
         self._clamp_pos()
         self._apply_pos()
-        if dx < 0:
-            self.sprite.set_state(State.WALKL)
-        elif dx > 0:
-            self.sprite.set_state(State.WALKR)
+        if dx < 0:   self.sprite.set_state(State.WALKL)
+        elif dx > 0: self.sprite.set_state(State.WALKR)
         self._ai_paused = True
         self.root.after(600, lambda: setattr(self, '_ai_paused', False))
 
@@ -366,25 +433,21 @@ class ModiApp:
         self._ai_paused = False
         self.sprite.set_state(State.IDLE)
 
-    # -- AI autonomous movement --
+    # -- AI movement --
 
     def _ai_step(self):
         if self._ai_paused or not self.visible:
             return
-
-        sw = self.root.winfo_screenwidth()
+        sw     = self.root.winfo_screenwidth()
         margin = 30
-
-        # Bounce off screen edges
         if self._wx <= margin:
             self._ai_dir = State.WALKR
-        elif self._wx >= sw - WIN_W - margin:
+        elif self._wx >= sw - self._win_w - margin:
             self._ai_dir = State.WALKL
 
-        # Decide new behavior at waypoint
         self._ai_steps += 1
         if self._ai_steps >= self._ai_target:
-            self._ai_steps = 0
+            self._ai_steps  = 0
             self._ai_target = random.randint(60, 220)
             r = random.random()
             if r < 0.25:
@@ -397,13 +460,10 @@ class ModiApp:
                 self._do_wave()
                 return
             if r < 0.55:
-                self._ai_dir = State.WALKL if self._ai_dir == State.WALKR else State.WALKR
+                self._ai_dir = (State.WALKL if self._ai_dir == State.WALKR
+                                else State.WALKR)
 
-        # Move one step
-        if self._ai_dir == State.WALKR:
-            self._wx += WALK_SPEED
-        else:
-            self._wx -= WALK_SPEED
+        self._wx += WALK_SPEED if self._ai_dir == State.WALKR else -WALK_SPEED
         self._clamp_pos()
         self._apply_pos()
         self.sprite.set_state(self._ai_dir)
@@ -413,22 +473,19 @@ class ModiApp:
     def _setup_tray(self):
         if not (HAS_PYSTRAY and HAS_PIL):
             return
-
         img = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse([9, 2, 23, 16],  fill='#F4C68F', outline='#D4A870')  # head
-        d.rectangle([7, 16, 25, 28], fill='white')                      # body
-        d.rectangle([7, 16, 18, 28], fill='#FF8800')                    # scarf hint
-        d.line([11, 28,  9, 32], fill='#F4C68F', width=3)               # left leg
-        d.line([21, 28, 23, 32], fill='#F4C68F', width=3)               # right leg
+        d   = ImageDraw.Draw(img)
+        d.ellipse([9, 2, 23, 16],    fill='#F4C68F', outline='#D4A870')
+        d.rectangle([7, 16, 25, 28], fill='white')
+        d.rectangle([7, 16, 18, 28], fill='#FF8800')
+        d.line([11, 28,  9, 32], fill='#F4C68F', width=3)
+        d.line([21, 28, 23, 32], fill='#F4C68F', width=3)
 
         def toggle(_icon, _item):
             if self.visible:
-                self.root.after(0, self.root.withdraw)
-                self.visible = False
+                self.root.after(0, self.root.withdraw);  self.visible = False
             else:
-                self.root.after(0, self.root.deiconify)
-                self.visible = True
+                self.root.after(0, self.root.deiconify); self.visible = True
 
         def do_quit(_icon, _item):
             _icon.stop()
@@ -446,10 +503,8 @@ class ModiApp:
 
     def quit(self):
         if self.tray:
-            try:
-                self.tray.stop()
-            except Exception:
-                pass
+            try: self.tray.stop()
+            except Exception: pass
         self.root.destroy()
 
     def _tick(self):
@@ -468,6 +523,24 @@ class ModiApp:
 def main():
     print("Modi Desktop Character — hai to mumkin hai!")
     print()
+
+    # Check for image
+    try:
+        pngs = [f for f in os.listdir(ASSETS_DIR)
+                if f.lower().endswith('.png') and not f.startswith('.')]
+    except OSError:
+        pngs = []
+
+    if pngs:
+        print(f"Found sprite image(s) in assets/: {', '.join(pngs)}")
+        if not HAS_PIL:
+            print("  → Install Pillow to use them:  pip install pillow")
+    else:
+        print("No image found in assets/ — using drawn character.")
+        print("  To use a real photo/render: drop a PNG (transparent bg) into assets/")
+        print("  Preferred name: assets/modi.png  (character should face RIGHT)")
+
+    print()
     print("Controls:")
     print("  Arrow keys       — manual movement")
     print("  Space            — wave")
@@ -475,9 +548,10 @@ def main():
     print("  Right-click      — context menu")
     print("  Click + drag     — reposition")
     print("  Escape / Q       — quit")
+
     if not HAS_PIL:
         print()
-        print("Optional: pip install pillow pystray   (enables system tray icon)")
+        print("Optional: pip install pillow pystray   (image support + system tray)")
 
     ModiApp().run()
 
