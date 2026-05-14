@@ -177,7 +177,7 @@ class Sprite:
         if not candidates:
             return
 
-        preferred = ['modi-2-old.png', 'modi.png', 'character.png', 'sprite.png']
+        preferred = ['modi.png', 'character.png', 'sprite.png']
         chosen = next((f for f in preferred if f in candidates), candidates[0])
         path   = os.path.join(ASSETS_DIR, chosen)
 
