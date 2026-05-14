@@ -49,7 +49,9 @@ C_BEARD = '#EFEFEF'
 C_EYE_P = '#111111'
 
 NFRAMES      = 8
-ASSETS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+# When frozen by PyInstaller, files live under sys._MEIPASS
+_BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+ASSETS_DIR = os.path.join(_BASE, 'assets')
 IMG_MAX_W    = 180         # max image width when resizing
 IMG_MAX_H    = 260         # max image height when resizing
 
