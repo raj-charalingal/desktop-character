@@ -11,6 +11,7 @@ Run: python main.py
 """
 
 import os
+import sys
 import tkinter as tk
 import math
 import random
