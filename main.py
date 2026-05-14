@@ -85,25 +85,24 @@ class Sprite:
     """
 
     def __init__(self, canvas: tk.Canvas, cx: int, cy: int):
-        self.c   = canvas
-        self.cx  = cx
-        self.cy  = cy
+        self.c     = canvas
+        self.cx    = cx
+        self.cy    = cy
         self.state = State.IDLE
         self.frame = 0
         self._ids: list[int] = []
 
-        # Image references (kept alive to avoid GC)
-        self._img_r: ImageTk.PhotoImage | None = None   # facing right
-        self._img_l: ImageTk.PhotoImage | None = None   # facing left (mirrored)
-        self.img_w  = 0
-        self.img_h  = 0
+        # Per-state animation frames (kept alive to prevent GC)
+        self._frames: dict[State, list[ImageTk.PhotoImage]] = {}
+        self.img_w = 0
+        self.img_h = 0
 
         self._load_sprite_image()
 
     # -- public API --
 
     def has_image(self) -> bool:
-        return self._img_r is not None
+        return bool(self._frames)
 
     def advance(self):
         self.frame = (self.frame + 1) % NFRAMES
@@ -112,7 +111,7 @@ class Sprite:
     def set_state(self, s: State):
         self.state = s
 
-    # -- image loading --
+    # -- image loading & frame generation --
 
     def _load_sprite_image(self):
         if not HAS_PIL:
@@ -134,11 +133,43 @@ class Sprite:
             img.thumbnail((IMG_MAX_W, IMG_MAX_H), Image.LANCZOS)
             self.img_w = img.width
             self.img_h = img.height
-            self._img_r = ImageTk.PhotoImage(img)
-            self._img_l = ImageTk.PhotoImage(ImageOps.mirror(img))
+            mir = ImageOps.mirror(img)
+
             print(f"Sprite loaded: {chosen}  ({img.width} × {img.height} px)")
+            print("Generating animation frames…")
+
+            self._frames = {
+                State.IDLE:  self._tilt_frames(img, n=6, amp=0.8),   # gentle idle sway
+                State.WALKR: self._tilt_frames(img, n=8, amp=3.5),
+                State.WALKL: self._tilt_frames(mir, n=8, amp=3.5),
+                State.RUNR:  self._tilt_frames(img, n=8, amp=7.0),
+                State.RUNL:  self._tilt_frames(mir, n=8, amp=7.0),
+                State.WAVE:  self._wave_frames(img),
+            }
+            print("Frames ready.")
         except Exception as exc:
             print(f"Warning — could not load sprite image: {exc}")
+
+    def _tilt_frames(self, img: 'Image.Image', n: int, amp: float) -> list:
+        """Generate n frames by rocking the image ±amp degrees (sine wave)."""
+        frames = []
+        for i in range(n):
+            phase = i / n * 2 * math.pi
+            angle = math.sin(phase) * amp
+            rotated = img.rotate(angle, resample=Image.BICUBIC, expand=False)
+            frames.append(ImageTk.PhotoImage(rotated))
+        return frames
+
+    def _wave_frames(self, img: 'Image.Image') -> list:
+        """8 frames: rock side-to-side with increasing then decreasing amplitude."""
+        frames = []
+        for i in range(8):
+            phase = i / 8 * 2 * math.pi
+            angle = math.sin(phase) * 8          # ±8° rock for wave
+            lean  = math.sin(phase * 2) * 3      # extra shimmy
+            rotated = img.rotate(angle + lean, resample=Image.BICUBIC, expand=False)
+            frames.append(ImageTk.PhotoImage(rotated))
+        return frames
 
     # -- rendering --
 
@@ -160,29 +191,31 @@ class Sprite:
     # -- image-based render --
 
     def _render_image(self):
-        c     = self.c
-        x, y  = self.cx, self.cy
-        f     = self.frame
-        s     = self.state
+        c    = self.c
+        x, y = self.cx, self.cy
+        s    = self.state
 
-        phase   = (f / NFRAMES) * 2 * math.pi
-        moving  = s in (State.WALKL, State.WALKR, State.RUNL, State.RUNR)
-        waving  = s == State.WAVE
-        go_left = s in (State.WALKL, State.RUNL)
+        frames = self._frames.get(s, self._frames.get(State.IDLE, []))
+        if not frames:
+            return
 
-        # Subtle vertical bob while walking / running
-        bob_y = int(abs(math.sin(phase)) * 4) if moving else 0
+        img_ref   = frames[self.frame % len(frames)]
+        phase     = (self.frame / NFRAMES) * 2 * math.pi
+        moving    = s in (State.WALKL, State.WALKR, State.RUNL, State.RUNR)
+        running   = s in (State.RUNL,  State.RUNR)
+        waving    = s == State.WAVE
 
-        img_ref = self._img_l if go_left else self._img_r
-        self._put(c.create_image(x, y - bob_y, image=img_ref, anchor='s'))
+        # Vertical bob: moves character up/down to simulate footsteps
+        if running:
+            bob = int(abs(math.sin(phase)) * 8)
+        elif moving:
+            bob = int(abs(math.sin(phase)) * 4)
+        elif waving:
+            bob = int(abs(math.sin(phase * 2)) * 3)
+        else:
+            bob = int(abs(math.sin(phase * 0.5)) * 1)   # barely-there idle breath
 
-        # Waving overlay: animated arc above character
-        if waving:
-            wx = x - self.img_w // 4 + int(math.sin(phase * 2) * 12)
-            wy = y - self.img_h + int(math.cos(phase * 2) * 10) + 10
-            self._put(c.create_arc(wx - 14, wy - 14, wx + 14, wy + 14,
-                                   start=0, extent=270,
-                                   outline=C_SCARF, width=4, style=tk.ARC))
+        self._put(c.create_image(x, y - bob, image=img_ref, anchor='s'))
 
     # -- drawn-fallback render --
 
